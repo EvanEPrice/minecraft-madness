@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation template for Minecraft server on Lightsail with Ubuntu 24.04 LTS'
+
+Parameters:
+  InstanceName:
+    Type: String
+    Default: 'minecraft-madness'
+    Description: 'Name for the Lightsail instance'
+
+  InstanceBundleId:
+    Type: String
+    Default: 'medium_2_0'
+    Description: 'Lightsail bundle ID (medium_2_0 = 2 vCPU, 4GB RAM, 80GB SSD)'
+    AllowedValues:
+      - 'micro_2_0'    # 1 vCPU, 1GB RAM, 40GB SSD
+      - 'small_2_0'    # 1 vCPU, 2GB RAM, 60GB SSD
+      - 'medium_2_0'   # 2 vCPU, 4GB RAM, 80GB SSD
+      - 'large_2_0'    # 2 vCPU, 8GB RAM, 160GB SSD
+      - 'xlarge_2_0'   # 4 vCPU, 16GB RAM, 320GB SSD
+
+  MinecraftVersion:
+    Type: String
+    Default: '1.20.4'
+    Description: 'Minecraft server version to install'
+
+  ServerMemory:
+    Type: String
+    Default: '3G'
+    Description: 'Memory allocation for Minecraft server (e.g., 2G, 3G, 4G)'
+
+
+
+Resources:
+  # Lightsail Instance
+  MinecraftInstance:
+    Type: AWS::Lightsail::Instance
+    Properties:
+      InstanceName: !Ref InstanceName
+      AvailabilityZone: !Sub '${AWS::Region}a'
+      BlueprintId: 'ubuntu_22_04'  # CHANGE THIS: Run 'aws lightsail get-blueprints --query "blueprints[?contains(name, 'Ubuntu')].{blueprintId:blueprintId, name:name}"' to get current Ubuntu blueprint IDs
+      BundleId: !Ref InstanceBundleId
+      UserData: !Sub |
+        #!/bin/bash
+        
+        # Update system
+        apt-get update -y
+        apt-get upgrade -y
+        
+        # Install Java 17 (required for modern Minecraft versions)
+        # Ubuntu 24.04 comes with Java 17 available in default repos
+        apt-get install -y openjdk-17-jre-headless wget screen htop
+        
+        # Create minecraft user
+        useradd -m -r -d /opt/minecraft minecraft
+        
+        # Create minecraft directory
+        mkdir -p /opt/minecraft/server
+        chown -R minecraft:minecraft /opt/minecraft
+        
+        # Create directories for minecraft data
+        mkdir -p /opt/minecraft/server
+        mkdir -p /opt/minecraft/backups
+        
+        # Download Minecraft server (update URL for different versions)
+        cd /opt/minecraft/server
+        wget -O server.jar https://piston-data.mojang.com/v1/objects/8dd1a28015f51b1803213892b50b7b4fc76e594d/server.jar
+        
+        # Accept EULA
+        echo "eula=true" > eula.txt
+        
+        # Create server.properties with basic configuration
+        cat > server.properties << EOF
+        #Minecraft server properties
+        enable-jmx-monitoring=false
+        rcon.port=25575
+        level-seed=
+        gamemode=survival
+        enable-command-block=false
+        enable-query=false
+        generator-settings={}
+        enforce-secure-profile=true
+        level-name=world
+        motd=A Minecraft Server on AWS Lightsail
+        query.port=25565
+        pvp=true
+        generate-structures=true
+        max-chained-neighbor-updates=1000000
+        difficulty=easy
+        network-compression-threshold=256
+        max-tick-time=60000
+        require-resource-pack=false
+        use-native-transport=true
+        max-players=20
+        online-mode=true
+        enable-status=true
+        allow-flight=false
+        initial-disabled-packs=
+        broadcast-rcon-to-ops=true
+        view-distance=10
+        server-ip=
+        resource-pack-prompt=
+        allow-nether=true
+        server-port=25565
+        enable-rcon=false
+        sync-chunk-writes=true
+        op-permission-level=4
+        prevent-proxy-connections=false
+        hide-online-players=false
+        resource-pack=
+        entity-broadcast-range-percentage=100
+        simulation-distance=10
+        rcon.password=
+        player-idle-timeout=0
+        debug=false
+        force-gamemode=false
+        rate-limit=0
+        hardcore=false
+        white-list=false
+        broadcast-console-to-ops=true
+        spawn-npcs=true
+        spawn-animals=true
+        function-permission-level=2
+        initial-enabled-packs=vanilla
+        level-type=minecraft\:normal
+        text-filtering-config=
+        spawn-monsters=true
+        enforce-whitelist=false
+        spawn-protection=16
+        resource-pack-sha1=
+        max-world-size=29999984
+        EOF
+        
+        # Create startup script
+        cat > /opt/minecraft/start.sh << EOF
+        #!/bin/bash
+        cd /opt/minecraft/server
+        java -Xmx${ServerMemory} -Xms1G -jar server.jar nogui
+        EOF
+        
+        chmod +x /opt/minecraft/start.sh
+        chown minecraft:minecraft /opt/minecraft/start.sh
+        
+        # Create systemd service
+        cat > /etc/systemd/system/minecraft.service << EOF
+        [Unit]
+        Description=Minecraft Server
+        After=network.target
+        
+        [Service]
+        Type=forking
+        User=minecraft
+        Group=minecraft
+        WorkingDirectory=/opt/minecraft/server
+        ExecStart=/usr/bin/screen -dmS minecraft /opt/minecraft/start.sh
+        ExecStop=/usr/bin/screen -p 0 -S minecraft -X eval 'stuff "say SERVER SHUTTING DOWN IN 10 SECONDS"\015'
+        ExecStop=/bin/sleep 10
+        ExecStop=/usr/bin/screen -p 0 -S minecraft -X eval 'stuff "stop"\015'
+        ExecStop=/bin/sleep 5
+        Restart=on-failure
+        RestartSec=15
+        
+        [Install]
+        WantedBy=multi-user.target
+        EOF
+        
+        # Set proper ownership
+        chown -R minecraft:minecraft /opt/minecraft
+        
+        # Enable and start the service
+        systemctl daemon-reload
+        systemctl enable minecraft.service
+        
+        # Create backup script
+        cat > /opt/minecraft/backup.sh << EOF
+        #!/bin/bash
+        DATE=\$(date +%Y%m%d_%H%M%S)
+        BACKUP_DIR="/opt/minecraft/backups"
+        mkdir -p \$BACKUP_DIR
+        
+        # Stop server gracefully
+        screen -p 0 -S minecraft -X eval 'stuff "save-all"\015'
+        sleep 5
+        screen -p 0 -S minecraft -X eval 'stuff "save-off"\015'
+        sleep 2
+        
+        # Create backup
+        tar -czf "\$BACKUP_DIR/minecraft_backup_\$DATE.tar.gz" -C /opt/minecraft/server world server.properties whitelist.json ops.json banned-players.json banned-ips.json
+        
+        # Re-enable saving
+        screen -p 0 -S minecraft -X eval 'stuff "save-on"\015'
+        
+        # Keep only last 7 backups
+        find \$BACKUP_DIR -name "minecraft_backup_*.tar.gz" -type f -mtime +7 -delete
+        EOF
+        
+        chmod +x /opt/minecraft/backup.sh
+        chown minecraft:minecraft /opt/minecraft/backup.sh
+        
+        # Add backup cron job (daily at 2 AM)
+        echo "0 2 * * * minecraft /opt/minecraft/backup.sh" | crontab -u minecraft -
+        
+        # Start the service after a delay to ensure disk is properly mounted
+        sleep 10
+        systemctl start minecraft.service
+        
+        # Create status check script
+        cat > /opt/minecraft/status.sh << EOF
+        #!/bin/bash
+        echo "=== Minecraft Server Status ==="
+        systemctl status minecraft.service --no-pager
+        echo ""
+        echo "=== Server Log (last 20 lines) ==="
+        screen -S minecraft -X hardcopy /tmp/minecraft.log 2>/dev/null
+        if [ -f /tmp/minecraft.log ]; then
+          tail -n 20 /tmp/minecraft.log
+          rm /tmp/minecraft.log
+        else
+          echo "No log available or server not running in screen"
+        fi
+        echo ""
+        echo "=== Disk Usage ==="
+        df -h /opt/minecraft
+        echo ""
+        echo "=== Memory Usage ==="
+        free -h
+        EOF
+        
+        chmod +x /opt/minecraft/status.sh
+
+      Tags:
+        - Key: 'Name'
+          Value: !Ref InstanceName
+        - Key: 'Purpose'
+          Value: 'Minecraft Server'
+
+  # Static IP for the instance
+  StaticIP:
+    Type: AWS::Lightsail::StaticIp
+    Properties:
+      StaticIpName: !Sub '${InstanceName}-static-ip'  # Auto-generate name
+      AttachedTo: !Ref MinecraftInstance
+
+Outputs:
+  InstanceName:
+    Description: 'Name of the Lightsail instance'
+    Value: !Ref MinecraftInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceName'
+
+  StaticIPAddress:
+    Description: 'Static IP address of the Minecraft server'
+    Value: !GetAtt StaticIP.IpAddress
+    Export:
+      Name: !Sub '${AWS::StackName}-StaticIP'
+
+  MinecraftServerAddress:
+    Description: 'Address to connect to the Minecraft server'
+    Value: !Sub '${StaticIP.IpAddress}:25565'
+    Export:
+      Name: !Sub '${AWS::StackName}-ServerAddress'
+
+  SSHCommand:
+    Description: 'SSH command to connect to the server'
+    Value: !Sub 'ssh -i your-key.pem ubuntu@${StaticIP.IpAddress}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SSHCommand'
