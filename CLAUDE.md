@@ -1,0 +1,3 @@
+- The topic of conversation will be Minecraft Java edition. The version is 1.21.11
+- Do not do any git commits, provide a commit message instead.
+- Do not sign your commit messages.
